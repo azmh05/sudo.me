@@ -1,0 +1,560 @@
+// My Personal Hub — database schema
+// Step 1: login. Step 2: finance. Step 3: bills, maintenance, goals. Step 4: vehicles, records. Step 5: health, planner, profile. Step 6: settings. Step 7: notifications. Other modules
+// are added in their own steps.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql" // works with XAMPP's MySQL/MariaDB
+  url      = env("DATABASE_URL")
+}
+
+// The single owner of this Hub. Only one row ever exists.
+model User {
+  id             Int       @id @default(autoincrement())
+  name           String    @db.VarChar(80)
+  passwordHash   String    @db.VarChar(100)
+  failedAttempts Int       @default(0)
+  lockedUntil    DateTime?
+  // Bumping this logs out every device (used when the password changes).
+  sessionVersion Int       @default(1)
+  // Lock the Hub after this many minutes without activity (0 = off).
+  idleLockMinutes Int      @default(0)
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+// History of every login attempt, shown later in Settings → Security.
+model LoginLog {
+  id        Int      @id @default(autoincrement())
+  success   Boolean
+  userAgent String?  @db.VarChar(255)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Step 2: Finance. All money is stored as whole sen (RM 12.50 = 1250).
+// ---------------------------------------------------------------------------
+
+enum AccountType {
+  BANK
+  EWALLET
+  CASH
+  CARD
+  SAVINGS
+  OTHER
+}
+
+enum CategoryKind {
+  INCOME
+  EXPENSE
+}
+
+enum TxType {
+  INCOME
+  EXPENSE
+  TRANSFER // moving money between your own accounts; not income or spending
+}
+
+model Account {
+  id             Int         @id @default(autoincrement())
+  name           String      @unique @db.VarChar(60)
+  type           AccountType
+  // Balance before your first record in the Hub. Can be negative (e.g. a card).
+  openingBalance Int         @default(0)
+  note           String?     @db.VarChar(255)
+  archived       Boolean     @default(false)
+  sortOrder      Int         @default(0)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  transactions Transaction[] @relation("TxAccount")
+  transfersIn  Transaction[] @relation("TxToAccount")
+}
+
+model Category {
+  id            Int          @id @default(autoincrement())
+  name          String       @db.VarChar(60)
+  kind          CategoryKind
+  // Monthly spending limit in sen (expense categories only). Null = no budget.
+  monthlyBudget Int?
+  archived      Boolean      @default(false)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  transactions Transaction[]
+
+  @@unique([name, kind])
+}
+
+model Transaction {
+  id          Int       @id @default(autoincrement())
+  type        TxType
+  amount      Int // always positive, in sen
+  date        DateTime  @db.Date
+  accountId   Int
+  account     Account   @relation("TxAccount", fields: [accountId], references: [id])
+  toAccountId Int? // transfers only
+  toAccount   Account?  @relation("TxToAccount", fields: [toAccountId], references: [id])
+  categoryId  Int?
+  category    Category? @relation(fields: [categoryId], references: [id])
+  note        String?   @db.VarChar(255)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  billPayment       BillPayment?
+  maintenanceLog    MaintenanceLog?
+  vehicleServiceLog VehicleServiceLog?
+  healthAppointment HealthAppointment?
+
+  @@index([date])
+  @@index([accountId])
+  @@index([toAccountId])
+  @@index([categoryId])
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: Bills & Maintenance, Goals.
+// ---------------------------------------------------------------------------
+
+enum BillFrequency {
+  WEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+}
+
+enum IntervalUnit {
+  DAY
+  WEEK
+  MONTH
+  YEAR
+}
+
+enum GoalType {
+  SAVINGS
+  EMERGENCY
+  PURCHASE
+}
+
+model Bill {
+  id          Int           @id @default(autoincrement())
+  name        String        @db.VarChar(80)
+  amount      Int // usual amount, in sen
+  frequency   BillFrequency @default(MONTHLY)
+  nextDueDate DateTime      @db.Date
+  // Day of month it's normally due, so 31st-of-month bills don't drift.
+  dueDay      Int           @default(1)
+  remindDays  Int           @default(7) // show on the dashboard this many days before due
+  accountId   Int? // usually paid from
+  categoryId  Int? // expense category used when paid
+  note        String?       @db.VarChar(255)
+  active      Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  payments BillPayment[]
+
+  @@index([nextDueDate])
+}
+
+model BillPayment {
+  id            Int          @id @default(autoincrement())
+  billId        Int
+  bill          Bill         @relation(fields: [billId], references: [id], onDelete: Cascade)
+  dueDate       DateTime     @db.Date // the due date this payment covered
+  paidDate      DateTime     @db.Date
+  amount        Int
+  // The expense record created when paying (if any).
+  transactionId Int?         @unique
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now())
+
+  @@index([billId, paidDate])
+}
+
+model MaintenanceItem {
+  id            Int           @id @default(autoincrement())
+  name          String        @db.VarChar(80)
+  groupLabel    String?       @db.VarChar(40) // e.g. Vehicle, Home, Device
+  intervalValue Int? // e.g. 6 ...
+  intervalUnit  IntervalUnit? // ... MONTH  → every 6 months
+  lastDoneDate  DateTime?     @db.Date
+  nextDueDate   DateTime?     @db.Date
+  remindDays    Int           @default(7)
+  note          String?       @db.VarChar(255)
+  active        Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  logs MaintenanceLog[]
+}
+
+model MaintenanceLog {
+  id            Int             @id @default(autoincrement())
+  itemId        Int
+  item          MaintenanceItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  doneDate      DateTime        @db.Date
+  cost          Int?
+  note          String?         @db.VarChar(255)
+  transactionId Int?            @unique
+  transaction   Transaction?    @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  createdAt     DateTime        @default(now())
+
+  @@index([itemId, doneDate])
+}
+
+// Goals are "envelopes": you record how much you've put aside for each one.
+model Goal {
+  id           Int       @id @default(autoincrement())
+  name         String    @db.VarChar(80)
+  type         GoalType  @default(SAVINGS)
+  targetAmount Int
+  targetDate   DateTime? @db.Date
+  note         String?   @db.VarChar(255)
+  archived     Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  contributions GoalContribution[]
+}
+
+model GoalContribution {
+  id        Int      @id @default(autoincrement())
+  goalId    Int
+  goal      Goal     @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  amount    Int // positive = added, negative = taken out
+  date      DateTime @db.Date
+  note      String?  @db.VarChar(255)
+  createdAt DateTime @default(now())
+
+  @@index([goalId, date])
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: Vehicles (mileage-based upkeep) and Records & Documents.
+// ---------------------------------------------------------------------------
+
+model Vehicle {
+  id           Int       @id @default(autoincrement())
+  name         String    @db.VarChar(60)
+  plate        String?   @db.VarChar(20)
+  odometer     Int       @default(0) // latest known reading, in km
+  odometerDate DateTime? @db.Date // when that reading was entered
+  note         String?   @db.VarChar(255)
+  archived     Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  items VehicleItem[]
+}
+
+model VehicleItem {
+  id           Int       @id @default(autoincrement())
+  vehicleId    Int
+  vehicle      Vehicle   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  name         String    @db.VarChar(80)
+  intervalKm   Int? // e.g. 2000 → every 2,000 km
+  lastDoneKm   Int?
+  lastDoneDate DateTime? @db.Date
+  nextDueKm    Int?
+  note         String?   @db.VarChar(255)
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  logs VehicleServiceLog[]
+
+  @@index([vehicleId])
+}
+
+model VehicleServiceLog {
+  id            Int          @id @default(autoincrement())
+  itemId        Int
+  item          VehicleItem  @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  doneDate      DateTime     @db.Date
+  odometer      Int
+  cost          Int?
+  note          String?      @db.VarChar(255)
+  transactionId Int?         @unique
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now())
+
+  @@index([itemId, doneDate])
+}
+
+enum RecordCategory {
+  IDENTITY
+  VEHICLE
+  INSURANCE
+  EDUCATION
+  FINANCE
+  WORK
+  HEALTH
+  PURCHASE
+  OTHER
+}
+
+// An important document (IC, licence, certificate, policy…).
+// The document number is stored encrypted; only its last 4 characters are readable.
+model PersonalRecord {
+  id          Int            @id @default(autoincrement())
+  title       String         @db.VarChar(100)
+  category    RecordCategory @default(OTHER)
+  numberEnc   String?        @db.Text
+  numberLast4 String?        @db.VarChar(4)
+  issuer      String?        @db.VarChar(100)
+  issueDate   DateTime?      @db.Date
+  expiryDate  DateTime?      @db.Date
+  remindDays  Int            @default(30) // start reminding this many days before expiry
+  note        String?        @db.Text
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  files RecordFile[]
+
+  @@index([expiryDate])
+}
+
+// Uploaded scan or photo. The file itself is stored encrypted in /storage/records.
+model RecordFile {
+  id           Int            @id @default(autoincrement())
+  recordId     Int
+  record       PersonalRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  originalName String         @db.VarChar(255)
+  mimeType     String         @db.VarChar(50)
+  size         Int
+  storageName  String         @unique @db.VarChar(64)
+  createdAt    DateTime       @default(now())
+
+  @@index([recordId])
+}
+
+// ---------------------------------------------------------------------------
+// Step 5: Health, Planner, Profile.
+// Times are stored as "HH:MM" text next to a date, so they never shift with time zones.
+// ---------------------------------------------------------------------------
+
+// A check-up that repeats, e.g. dental scaling every 6 months.
+model HealthCheckup {
+  id            Int          @id @default(autoincrement())
+  name          String       @db.VarChar(80)
+  intervalValue Int          @default(6)
+  intervalUnit  IntervalUnit @default(MONTH)
+  bookLeadDays  Int          @default(21) // start "time to book" reminders this many days before due
+  lastDoneDate  DateTime?    @db.Date
+  nextDueDate   DateTime?    @db.Date
+  place         String?      @db.VarChar(120) // usual clinic
+  note          String?      @db.VarChar(255)
+  active        Boolean      @default(true)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  appointments HealthAppointment[]
+}
+
+enum BookedVia {
+  MYSEJAHTERA
+  PHONE
+  WALK_IN
+  ONLINE
+  OTHER
+}
+
+enum AppointmentStatus {
+  BOOKED
+  DONE
+}
+
+model HealthAppointment {
+  id            Int               @id @default(autoincrement())
+  title         String            @db.VarChar(100)
+  checkupId     Int?
+  checkup       HealthCheckup?    @relation(fields: [checkupId], references: [id], onDelete: SetNull)
+  date          DateTime          @db.Date
+  time          String?           @db.VarChar(5)
+  place         String?           @db.VarChar(120)
+  bookedVia     BookedVia?
+  reference     String?           @db.VarChar(60)
+  note          String?           @db.VarChar(500) // e.g. "fast 8 hours before"
+  status        AppointmentStatus @default(BOOKED)
+  outcome       String?           @db.Text // what the doctor said (stored encrypted when a key is set)
+  cost          Int?
+  transactionId Int?              @unique
+  transaction   Transaction?      @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([date])
+}
+
+// One row: quick health facts for clinic forms and emergencies.
+model HealthProfile {
+  id               Int      @id @default(1)
+  bloodType        String?  @db.VarChar(5)
+  allergies        String?  @db.VarChar(500)
+  medications      String?  @db.VarChar(500)
+  conditions       String?  @db.VarChar(500)
+  emergencyName     String?  @db.VarChar(80)
+  emergencyPhone    String?  @db.VarChar(30)
+  emergencyRelation String? @db.VarChar(40)
+  note             String?  @db.VarChar(500)
+  updatedAt        DateTime @updatedAt
+}
+
+enum TaskPriority {
+  LOW
+  NORMAL
+  HIGH
+}
+
+model Task {
+  id          Int          @id @default(autoincrement())
+  title       String       @db.VarChar(160)
+  dueDate     DateTime?    @db.Date
+  dueTime     String?      @db.VarChar(5)
+  priority    TaskPriority @default(NORMAL)
+  remindMinutes Int? // push reminder this many minutes before (needs a time); null = none
+  done        Boolean      @default(false)
+  completedAt DateTime?
+  note        String?      @db.VarChar(1000)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([done, dueDate])
+}
+
+model PlannerEvent {
+  id        Int      @id @default(autoincrement())
+  title     String   @db.VarChar(160)
+  date      DateTime @db.Date
+  startTime String?  @db.VarChar(5) // empty = all day
+  endTime   String?  @db.VarChar(5)
+  location  String?  @db.VarChar(160)
+  remindMinutes Int? // push reminder this many minutes before; null = none
+  note      String?  @db.VarChar(1000)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+}
+
+// One journal entry per day. Content is stored encrypted when ENCRYPTION_KEY is set.
+model JournalEntry {
+  id        Int      @id @default(autoincrement())
+  date      DateTime @unique @db.Date
+  content   String   @db.MediumText
+  mood      Int? // 1 (rough) … 5 (great)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// One row: your personal details.
+model ProfileInfo {
+  id            Int       @id @default(1)
+  fullName      String?   @db.VarChar(120)
+  preferredName String?   @db.VarChar(60)
+  dateOfBirth   DateTime? @db.Date
+  phone         String?   @db.VarChar(30)
+  email         String?   @db.VarChar(120)
+  address       String?   @db.VarChar(300)
+  about         String?   @db.Text
+  photoId       Int? // the ProfilePhoto currently in use
+  updatedAt     DateTime  @updatedAt
+}
+
+// Every profile picture you've uploaded (stored encrypted), so you can switch back.
+model ProfilePhoto {
+  id          Int      @id @default(autoincrement())
+  mimeType    String   @db.VarChar(50)
+  size        Int
+  storageName String   @unique @db.VarChar(64)
+  createdAt   DateTime @default(now())
+}
+
+enum ProfileEntryKind {
+  EDUCATION
+  WORK
+  SKILL
+  CERTIFICATION
+  ACHIEVEMENT
+}
+
+model ProfileEntry {
+  id           Int              @id @default(autoincrement())
+  kind         ProfileEntryKind
+  title        String           @db.VarChar(160) // programme, role, skill, certificate, award
+  organisation String?          @db.VarChar(160) // school, company, issuer
+  detail       String?          @db.VarChar(120) // CGPA, job type, skill level, credential ID
+  startDate    DateTime?        @db.Date
+  endDate      DateTime?        @db.Date
+  current      Boolean          @default(false)
+  description  String?          @db.Text
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([kind])
+}
+
+// ---------------------------------------------------------------------------
+// Step 6: Settings — what changed and when.
+// ---------------------------------------------------------------------------
+
+model ActivityLog {
+  id        Int      @id @default(autoincrement())
+  action    String   @db.VarChar(20) // Created, Updated, Deleted …
+  entity    String   @db.VarChar(40) // model name, e.g. Bill
+  label     String   @db.VarChar(160)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Step 7: Push notifications.
+// ---------------------------------------------------------------------------
+
+// One per device/browser where you tapped "Enable notifications".
+model PushSubscription {
+  id         Int       @id @default(autoincrement())
+  endpoint   String    @unique @db.VarChar(600)
+  p256dh     String    @db.VarChar(200)
+  auth       String    @db.VarChar(100)
+  device     String    @db.VarChar(80)
+  createdAt  DateTime  @default(now())
+  lastSentAt DateTime?
+}
+
+// Small key/value store (e.g. the push "VAPID" keys, created automatically).
+model AppSetting {
+  key   String @id @db.VarChar(60)
+  value String @db.Text
+}
+
+model NotificationPrefs {
+  id           Int      @id @default(1)
+  bills        Boolean  @default(true)
+  upkeep       Boolean  @default(true)
+  documents    Boolean  @default(true)
+  health       Boolean  @default(true)
+  planner      Boolean  @default(true)
+  dailySummary Boolean  @default(true)
+  summaryTime  String   @default("08:00") @db.VarChar(5) // morning reminders go out from this time
+  overdueTasks Boolean  @default(true)
+  loginAlerts  Boolean  @default(true)
+  showDetails  Boolean  @default(true) // false = "You have a reminder" on the lock screen
+  updatedAt    DateTime @updatedAt
+}
+
+// Remembers what was already sent, so nothing is sent twice.
+model NotificationSent {
+  key    String   @id @db.VarChar(120)
+  sentAt DateTime @default(now())
+
+  @@index([sentAt])
+}
